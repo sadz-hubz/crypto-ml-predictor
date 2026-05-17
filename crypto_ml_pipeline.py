@@ -382,37 +382,36 @@ def train_model(df):
     best_rf.fit(X_s, y)
     best_gb.fit(X_s, y)
     
-    # --- Stacking Ensemble ---
-    log("Building Stacking Ensemble...")
-    stacking = StackingClassifier(
+    # --- Voting Ensemble (soft voting) ---
+    log("Building Voting Ensemble...")
+    voting = VotingClassifier(
         estimators=[
             ('xgb', xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **best_xgb_params)),
             ('rf', RandomForestClassifier(random_state=42, n_jobs=-1, **best_rf_params)),
             ('gb', GradientBoostingClassifier(random_state=42, **best_gb_params)),
         ],
-        final_estimator=LogisticRegression(C=1.0, max_iter=1000),
-        cv=tscv,
-        stack_method='predict_proba',
+        voting='soft',
+        weights=[1.2, 1.0, 1.1],
         n_jobs=-1
     )
     
-    # Evaluate stacking
-    stack_accs = []
+    # Evaluate voting
+    vote_accs = []
     for train_idx, test_idx in tscv.split(X_s):
         X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
         y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-        stacking.fit(X_tr, y_tr)
-        stack_accs.append(accuracy_score(y_te, stacking.predict(X_te)))
+        voting.fit(X_tr, y_tr)
+        vote_accs.append(accuracy_score(y_te, voting.predict(X_te)))
     
-    stack_avg = np.mean(stack_accs)
-    log(f"  Stacking: {stack_avg:.4f}")
+    vote_avg = np.mean(vote_accs)
+    log(f"  Voting: {vote_avg:.4f}")
     
     # --- Pick best ---
     results = {
         'XGB': (best_xgb_acc, best_xgb),
         'RF': (best_rf_acc, best_rf),
         'GB': (best_gb_acc, best_gb),
-        'Stacking': (stack_avg, stacking),
+        'Voting': (vote_avg, voting),
     }
     
     best_name = max(results, key=lambda k: results[k][0])
@@ -424,9 +423,9 @@ def train_model(df):
         log(f"  {marker} {name}: {acc:.4f}")
     
     # Final train on ALL data
-    if best_name == 'Stacking':
-        stacking.fit(X_s, y)
-        final_model = stacking
+    if best_name == 'Voting':
+        voting.fit(X_s, y)
+        final_model = voting
     # else already fitted above
     
     return final_model, scaler, top_features, best_name, best_acc
