@@ -39,43 +39,73 @@ def log(msg):
 # ============================================================
 def fetch_data():
     log("Fetching BTC data...")
+    df = None
     
-    # Try CoinGecko first
+    # --- Source 1: CoinGecko ---
     try:
         url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         params = {'vs_currency': 'usd', 'days': 730, 'interval': 'daily'}
         resp = requests.get(url, params=params, timeout=30)
         data = resp.json()
-        
-        if 'prices' in data and len(data['prices']) > 0:
+        if 'prices' in data and len(data['prices']) > 10:
             df = pd.DataFrame(data['prices'], columns=['ts', 'price'])
             df['date'] = pd.to_datetime(df['ts'], unit='ms')
             vol = pd.DataFrame(data['total_volumes'], columns=['ts', 'volume'])
-            df['volume'] = vol['volume']
+            df['volume'] = vol['volume'].values
             df = df.set_index('date').drop('ts', axis=1)
+            df['price'] = df['price'].astype(float)
+            df['volume'] = df['volume'].astype(float)
             log(f"CoinGecko OK: {len(df)} rows")
         else:
-            raise ValueError("CoinGecko returned empty data")
+            raise ValueError("empty")
     except Exception as e:
-        log(f"CoinGecko failed: {e}, trying Binance...")
-        # Fallback to Binance
-        url = "https://api.binance.com/api/v3/klines"
-        params = {'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 730}
-        resp = requests.get(url, params=params, timeout=30)
-        data = resp.json()
-        
-        df = pd.DataFrame(data, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignore'
-        ])
-        df['date'] = pd.to_datetime(df['open_time'], unit='ms')
-        df['price'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        df = df.set_index('date')[['price', 'volume']]
-        log(f"Binance OK: {len(df)} rows")
+        log(f"CoinGecko failed: {e}")
     
-    # F&G
+    # --- Source 2: Binance ---
+    if df is None or len(df) == 0:
+        try:
+            url = "https://api.binance.com/api/v3/klines"
+            params = {'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 500}
+            resp = requests.get(url, params=params, timeout=30)
+            raw = resp.json()
+            if isinstance(raw, list) and len(raw) > 10:
+                df = pd.DataFrame(raw, columns=[
+                    'open_time','open','high','low','close','volume',
+                    'close_time','quote_volume','trades','taker_buy_base',
+                    'taker_buy_quote','ignore'
+                ])
+                df['date'] = pd.to_datetime(df['open_time'], unit='ms')
+                df['price'] = df['close'].astype(float)
+                df['volume'] = df['volume'].astype(float)
+                df = df.set_index('date')[['price','volume']]
+                log(f"Binance OK: {len(df)} rows")
+            else:
+                raise ValueError("empty")
+        except Exception as e:
+            log(f"Binance failed: {e}")
+    
+    # --- Source 3: CoinCap (last resort) ---
+    if df is None or len(df) == 0:
+        try:
+            url = "https://api.coincap.io/v2/assets/bitcoin/history?interval=d1"
+            resp = requests.get(url, params={'interval': 'd1'}, timeout=30)
+            raw = resp.json()
+            if 'data' in raw and len(raw['data']) > 10:
+                df = pd.DataFrame(raw['data'])
+                df['date'] = pd.to_datetime(df['time'], unit='ms')
+                df['price'] = df['priceUsd'].astype(float)
+                df['volume'] = 0.0
+                df = df.set_index('date')[['price','volume']]
+                log(f"CoinCap OK: {len(df)} rows")
+            else:
+                raise ValueError("empty")
+        except Exception as e:
+            log(f"CoinCap failed: {e}")
+    
+    if df is None or len(df) == 0:
+        raise RuntimeError("All data sources failed!")
+    
+    # --- F&G Index ---
     try:
         fng = requests.get("https://api.alternative.me/fng/?limit=730", timeout=30).json()['data']
         fng_df = pd.DataFrame(fng)
@@ -86,18 +116,20 @@ def fetch_data():
     except:
         df['fng'] = 50
     
-    # Macro
+    # --- Macro ---
     try:
         import yfinance as yf
-        dxy = yf.download('DX-Y.NYB', period='2y', progress=False)['Close']
-        sp = yf.download('^GSPC', period='2y', progress=False)['Close']
-        df = df.join(dxy.rename('dxy'), how='left')
-        df = df.join(sp.rename('sp500'), how='left')
+        dxy = yf.download('DX-Y.NYB', period='2y', progress=False)
+        if not dxy.empty:
+            df = df.join(dxy['Close'].rename('dxy'), how='left')
+        sp = yf.download('^GSPC', period='2y', progress=False)
+        if not sp.empty:
+            df = df.join(sp['Close'].rename('sp500'), how='left')
     except:
         pass
     
     df = df.ffill().bfill()
-    log(f"Data: {len(df)} rows")
+    log(f"Final data: {len(df)} rows, {df.index[0].date()} → {df.index[-1].date()}")
     return df
 
 # ============================================================
@@ -317,7 +349,26 @@ def main():
     log("=" * 40)
     
     # 1. Fetch
-    df = fetch_data()
+    try:
+        df = fetch_data()
+    except Exception as e:
+        log(f"FATAL: Cannot fetch data: {e}")
+        # Send error to Telegram
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                requests.post(url, json={
+                    'chat_id': TELEGRAM_CHAT_ID,
+                    'text': f"⚠️ <b>Pipeline Error</b>\n\nCannot fetch BTC data.\nError: {e}\n\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')} WIB",
+                    'parse_mode': 'HTML'
+                }, timeout=30)
+            except:
+                pass
+        sys.exit(1)
+    
+    if len(df) < 100:
+        log(f"FATAL: Not enough data ({len(df)} rows)")
+        sys.exit(1)
     
     # 2. Features
     df = add_features(df)
