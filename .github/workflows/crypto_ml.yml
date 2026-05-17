@@ -3,7 +3,7 @@ name: Crypto ML Daily Pipeline
 on:
   schedule:
     - cron: '0 2 * * *'  # 09:00 WIB = 02:00 UTC
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
@@ -17,27 +17,20 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
-        run: |
-          pip install pandas numpy scikit-learn xgboost yfinance requests joblib
+        run: pip install pandas numpy scikit-learn xgboost yfinance requests joblib
       
       - name: Run ML Pipeline
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OUTPUT_DIR: ./models
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: python crypto_ml_pipeline.py
       
       - name: Upload model artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: crypto-model
           path: models/
           retention-days: 30
-      
-      - name: Commit model to repo
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add models/
-          git commit -m "Update model - $(date +%Y-%m-%d)" || echo "No changes"
-          git push || echo "Push failed"
