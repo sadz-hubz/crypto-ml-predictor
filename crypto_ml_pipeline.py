@@ -39,16 +39,41 @@ def log(msg):
 # ============================================================
 def fetch_data():
     log("Fetching BTC data...")
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-    params = {'vs_currency': 'usd', 'days': 730, 'interval': 'daily'}
-    resp = requests.get(url, params=params, timeout=30)
-    data = resp.json()
     
-    df = pd.DataFrame(data['prices'], columns=['ts', 'price'])
-    df['date'] = pd.to_datetime(df['ts'], unit='ms')
-    vol = pd.DataFrame(data['total_volumes'], columns=['ts', 'volume'])
-    df['volume'] = vol['volume']
-    df = df.set_index('date').drop('ts', axis=1)
+    # Try CoinGecko first
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        params = {'vs_currency': 'usd', 'days': 730, 'interval': 'daily'}
+        resp = requests.get(url, params=params, timeout=30)
+        data = resp.json()
+        
+        if 'prices' in data and len(data['prices']) > 0:
+            df = pd.DataFrame(data['prices'], columns=['ts', 'price'])
+            df['date'] = pd.to_datetime(df['ts'], unit='ms')
+            vol = pd.DataFrame(data['total_volumes'], columns=['ts', 'volume'])
+            df['volume'] = vol['volume']
+            df = df.set_index('date').drop('ts', axis=1)
+            log(f"CoinGecko OK: {len(df)} rows")
+        else:
+            raise ValueError("CoinGecko returned empty data")
+    except Exception as e:
+        log(f"CoinGecko failed: {e}, trying Binance...")
+        # Fallback to Binance
+        url = "https://api.binance.com/api/v3/klines"
+        params = {'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 730}
+        resp = requests.get(url, params=params, timeout=30)
+        data = resp.json()
+        
+        df = pd.DataFrame(data, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+        df['date'] = pd.to_datetime(df['open_time'], unit='ms')
+        df['price'] = df['close'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+        df = df.set_index('date')[['price', 'volume']]
+        log(f"Binance OK: {len(df)} rows")
     
     # F&G
     try:
