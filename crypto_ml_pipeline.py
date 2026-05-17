@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-crypto_ml_pipeline.py — ULTRA VERSION
-Maxed out features + hyperparameter tuning + ensemble
+crypto_ml_pipeline.py — MAXIMUM POWER VERSION
+Feature selection + GridSearchCV + Stacking + Multi-timeframe
 """
 
 import pandas as pd
@@ -13,12 +13,12 @@ import json
 import os
 import sys
 from datetime import datetime
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
+from sklearn.feature_selection import mutual_info_classif
 import xgboost as xgb
 import warnings
 warnings.filterwarnings('ignore')
@@ -34,7 +34,7 @@ def log(msg):
 # FETCH DATA
 # ============================================================
 def fetch_data():
-    log("Fetching BTC data via yfinance...")
+    log("Fetching BTC data via yfinance (5 years)...")
     import yfinance as yf
     
     btc = yf.download('BTC-USD', period='5y', interval='1d', progress=False)
@@ -73,18 +73,17 @@ def fetch_data():
     return df
 
 # ============================================================
-# ULTRA FEATURES
+# MAXIMUM FEATURES (200+)
 # ============================================================
 def add_features(df):
-    log("Computing features...")
+    log("Computing 200+ features...")
     
-    # --- Price Returns (all timeframes) ---
+    # --- Returns ---
     for d in [1,2,3,5,7,10,14,21,30,60,90,180,365]:
         df[f'ret_{d}d'] = df['price'].pct_change(d)
-    
     df['log_ret_1d'] = np.log(df['price'] / df['price'].shift(1))
     
-    # --- Moving Averages (all periods) ---
+    # --- SMA ---
     for p in [3,5,7,10,14,20,25,30,50,75,100,150,200,250,365]:
         df[f'sma_{p}'] = df['price'].rolling(p).mean()
         df[f'price_vs_sma_{p}'] = (df['price'] - df[f'sma_{p}']) / df[f'sma_{p}']
@@ -95,7 +94,7 @@ def add_features(df):
         df[f'ema_{p}'] = df['price'].ewm(span=p, adjust=False).mean()
         df[f'price_vs_ema_{p}'] = (df['price'] - df[f'ema_{p}']) / df[f'ema_{p}']
     
-    # --- MACD (multiple settings) ---
+    # --- MACD ---
     for fast,slow,signal in [(12,26,9),(8,21,5),(5,35,5)]:
         ema_f = df['price'].ewm(span=fast, adjust=False).mean()
         ema_s = df['price'].ewm(span=slow, adjust=False).mean()
@@ -103,7 +102,7 @@ def add_features(df):
         df[f'macd_{fast}_{slow}_signal'] = df[f'macd_{fast}_{slow}'].ewm(span=signal, adjust=False).mean()
         df[f'macd_{fast}_{slow}_hist'] = df[f'macd_{fast}_{slow}'] - df[f'macd_{fast}_{slow}_signal']
     
-    # --- RSI (all periods) ---
+    # --- RSI ---
     def calc_rsi(series, period):
         delta = series.diff()
         gain = delta.where(delta > 0, 0).rolling(period).mean()
@@ -113,13 +112,11 @@ def add_features(df):
     
     for p in [5,7,9,14,21,28]:
         df[f'rsi_{p}'] = calc_rsi(df['price'], p)
-    
-    # RSI divergence
     df['rsi_14_slope'] = df['rsi_14'].diff(5)
     df['price_slope_5d'] = df['price'].pct_change(5)
-    df['rsi_divergence'] = np.sign(df['price_slope_5d']) != np.sign(df['rsi_14_slope'])
+    df['rsi_divergence'] = (np.sign(df['price_slope_5d']) != np.sign(df['rsi_14_slope'])).astype(int)
     
-    # --- Bollinger Bands (multiple settings) ---
+    # --- Bollinger Bands ---
     for p in [10,20,30]:
         for mult in [1.5, 2.0, 2.5]:
             mid = df['price'].rolling(p).mean()
@@ -135,15 +132,12 @@ def add_features(df):
         df[f'atr_{p}'] = hl.rolling(p).mean()
         df[f'atr_{p}_pct'] = df[f'atr_{p}'] / df['price']
     
-    # --- Volume Features ---
+    # --- Volume ---
     for p in [3,5,7,14,21,30,60]:
         df[f'vol_sma_{p}'] = df['volume'].rolling(p).mean()
         df[f'vol_ratio_{p}'] = df['volume'] / df[f'vol_sma_{p}']
-    
     df['vol_change_1d'] = df['volume'].pct_change(1)
     df['vol_change_7d'] = df['volume'].pct_change(7)
-    
-    # OBV (On-Balance Volume)
     df['obv'] = (np.sign(df['price'].diff()) * df['volume']).cumsum()
     df['obv_sma_20'] = df['obv'].rolling(20).mean()
     df['obv_vs_sma'] = df['obv'] / df['obv_sma_20']
@@ -151,14 +145,11 @@ def add_features(df):
     # --- Volatility ---
     for p in [5,7,10,14,21,30,60]:
         df[f'volatility_{p}d'] = df['log_ret_1d'].rolling(p).std()
-    
     df['vol_regime'] = df['volatility_7d'] / df['volatility_30d']
     
     # --- Momentum ---
     for d in [1,3,5,7,10,14,21,30,60,90]:
         df[f'momentum_{d}d'] = df['price'] / df['price'].shift(d) - 1
-    
-    # Rate of Change
     for d in [10,20,30]:
         df[f'roc_{d}'] = (df['price'] - df['price'].shift(d)) / df['price'].shift(d) * 100
     
@@ -175,7 +166,7 @@ def add_features(df):
         low = df['price'].rolling(p).min()
         df[f'williams_r_{p}'] = (high - df['price']) / (high - low).replace(0, np.nan) * -100
     
-    # --- CCI (Commodity Channel Index) ---
+    # --- CCI ---
     for p in [14,20]:
         tp = df['price']
         tp_sma = tp.rolling(p).mean()
@@ -189,7 +180,7 @@ def add_features(df):
         df[f'price_vs_support_{window}'] = (df['price'] - df[f'support_{window}']) / df[f'support_{window}']
         df[f'price_vs_resistance_{window}'] = (df['price'] - df[f'resistance_{window}']) / df[f'resistance_{window}']
     
-    # --- Trend Strength ---
+    # --- Trend ---
     df['trend_7d'] = np.where(df['price'] > df['sma_7'], 1, -1)
     df['trend_20d'] = np.where(df['price'] > df['sma_20'], 1, -1)
     df['trend_50d'] = np.where(df['price'] > df['sma_50'], 1, -1)
@@ -205,13 +196,13 @@ def add_features(df):
     df['is_month_end'] = df.index.is_month_end.astype(int)
     df['day_of_month'] = df.index.day
     
-    # --- Macro Features ---
+    # --- Macro ---
     for col in ['dxy','sp500','gold','vix']:
         if col in df.columns:
             for d in [1,3,5,7,14,30]:
                 df[f'{col}_ret_{d}d'] = df[col].pct_change(d)
     
-    # --- F&G Features ---
+    # --- F&G ---
     if 'fng' in df.columns:
         df['fng_sma_7'] = df['fng'].rolling(7).mean()
         df['fng_sma_30'] = df['fng'].rolling(30).mean()
@@ -219,7 +210,7 @@ def add_features(df):
         df['fng_extreme_fear'] = (df['fng'] < 20).astype(int)
         df['fng_extreme_greed'] = (df['fng'] > 80).astype(int)
     
-    log(f"Features: {len(df.columns)} columns")
+    log(f"Raw features: {len(df.columns)}")
     return df
 
 # ============================================================
@@ -231,7 +222,32 @@ def add_target(df):
     return df
 
 # ============================================================
-# TRAIN — Ensemble + Tuning
+# FEATURE SELECTION — Mutual Information
+# ============================================================
+def select_features(X, y, n_features=50):
+    log(f"Selecting top {n_features} features via Mutual Information...")
+    
+    # Remove constant features
+    constant_cols = [c for c in X.columns if X[c].nunique() <= 1]
+    X = X.drop(columns=constant_cols, errors='ignore')
+    
+    # Fill NaN for MI calculation
+    X_filled = X.fillna(0)
+    
+    # Mutual Information
+    mi_scores = mutual_info_classif(X_filled, y, random_state=42, n_neighbors=5)
+    mi_df = pd.DataFrame({'feature': X.columns, 'mi': mi_scores}).sort_values('mi', ascending=False)
+    
+    top_features = mi_df.head(n_features)['feature'].tolist()
+    
+    log(f"Top 10 features:")
+    for _, row in mi_df.head(10).iterrows():
+        log(f"  {row['feature']}: {row['mi']:.4f}")
+    
+    return top_features
+
+# ============================================================
+# TRAIN — GridSearchCV + Stacking
 # ============================================================
 def train_model(df):
     exclude = ['price', 'volume',
@@ -241,103 +257,179 @@ def train_model(df):
                'bb_20_1.5_upper','bb_20_1.5_lower','bb_20_2.0_upper','bb_20_2.0_lower','bb_20_2.5_upper','bb_20_2.5_lower',
                'bb_30_1.5_upper','bb_30_1.5_lower','bb_30_2.0_upper','bb_30_2.0_lower','bb_30_2.5_upper','bb_30_2.5_lower',
                'vol_sma_3','vol_sma_5','vol_sma_7','vol_sma_14','vol_sma_21','vol_sma_30','vol_sma_60',
-               'atr_7','atr_14','atr_21',
-               'obv','obv_sma_20',
+               'atr_7','atr_14','atr_21','obv','obv_sma_20',
                'dxy','sp500','gold','vix',
                'support_20','support_50','support_100','support_200',
                'resistance_20','resistance_50','resistance_100','resistance_200',
                'target_ret_7d','target_dir_7d']
     
-    features = [c for c in df.columns if c not in exclude]
+    all_features = [c for c in df.columns if c not in exclude]
     df_clean = df.dropna()
-    X = df_clean[features]
+    X_all = df_clean[all_features]
     y = df_clean['target_dir_7d']
     
-    log(f"Training: {len(X)} samples, {len(features)} features")
+    # Feature Selection
+    top_features = select_features(X_all, y, n_features=60)
+    X = df_clean[top_features]
+    
+    log(f"Training: {len(X)} samples, {len(top_features)} features")
     
     tscv = TimeSeriesSplit(n_splits=5)
+    scaler = StandardScaler()
+    X_s = pd.DataFrame(scaler.fit_transform(X), columns=top_features, index=X.index)
     
-    # --- Individual Models (pre-tuned) ---
-    models = {
-        'RF': RandomForestClassifier(
-            n_estimators=500, max_depth=15, min_samples_split=10,
-            min_samples_leaf=5, max_features='sqrt', random_state=42, n_jobs=-1
-        ),
-        'GB': GradientBoostingClassifier(
-            n_estimators=500, max_depth=6, learning_rate=0.03,
-            subsample=0.8, min_samples_split=10, random_state=42
-        ),
-        'XGB': xgb.XGBClassifier(
-            n_estimators=500, max_depth=7, learning_rate=0.03,
-            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=1.0,
-            random_state=42, use_label_encoder=False, eval_metric='logloss'
-        ),
-        'LR': LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+    # --- GridSearch: XGBoost ---
+    log("GridSearch XGBoost...")
+    xgb_params = {
+        'n_estimators': [300, 500, 700],
+        'max_depth': [4, 6, 8],
+        'learning_rate': [0.01, 0.03, 0.05],
+        'subsample': [0.7, 0.8, 0.9],
+        'colsample_bytree': [0.7, 0.8, 0.9],
+        'reg_alpha': [0, 0.1, 0.5],
+        'reg_lambda': [0.5, 1.0, 2.0],
     }
     
-    results = {}
-    for name, model in models.items():
-        accs = []
-        for train_idx, test_idx in tscv.split(X):
-            X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            scaler = StandardScaler()
-            X_tr_s = scaler.fit_transform(X_tr)
-            X_te_s = scaler.transform(X_te)
-            model.fit(X_tr_s, y_tr)
-            preds = model.predict(X_te_s)
-            accs.append(accuracy_score(y_te, preds))
-        avg = np.mean(accs)
-        results[name] = avg
-        log(f"  {name}: {avg:.4f}")
+    xgb_model = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0)
     
-    # --- Ensemble: Voting Classifier ---
-    log("Building ensemble...")
-    ensemble = VotingClassifier(
+    # Manual grid search with walk-forward (faster than GridSearchCV for time series)
+    best_xgb_acc = 0
+    best_xgb_params = {}
+    
+    # Sample a subset of params to search (full grid too slow)
+    param_grid = [
+        {'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.03, 'subsample': 0.8, 'colsample_bytree': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 1.0},
+        {'n_estimators': 700, 'max_depth': 6, 'learning_rate': 0.01, 'subsample': 0.8, 'colsample_bytree': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 1.0},
+        {'n_estimators': 500, 'max_depth': 8, 'learning_rate': 0.03, 'subsample': 0.7, 'colsample_bytree': 0.7, 'reg_alpha': 0.5, 'reg_lambda': 2.0},
+        {'n_estimators': 300, 'max_depth': 4, 'learning_rate': 0.05, 'subsample': 0.9, 'colsample_bytree': 0.9, 'reg_alpha': 0, 'reg_lambda': 0.5},
+        {'n_estimators': 700, 'max_depth': 7, 'learning_rate': 0.02, 'subsample': 0.8, 'colsample_bytree': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 1.0},
+    ]
+    
+    for params in param_grid:
+        accs = []
+        model = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **params)
+        for train_idx, test_idx in tscv.split(X_s):
+            X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
+            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+            model.fit(X_tr, y_tr)
+            accs.append(accuracy_score(y_te, model.predict(X_te)))
+        avg = np.mean(accs)
+        if avg > best_xgb_acc:
+            best_xgb_acc = avg
+            best_xgb_params = params
+            log(f"  XGB new best: {avg:.4f} | {params}")
+    
+    # --- GridSearch: Random Forest ---
+    log("GridSearch Random Forest...")
+    rf_param_grid = [
+        {'n_estimators': 500, 'max_depth': 15, 'min_samples_split': 10, 'min_samples_leaf': 5, 'max_features': 'sqrt'},
+        {'n_estimators': 700, 'max_depth': 12, 'min_samples_split': 15, 'min_samples_leaf': 7, 'max_features': 'sqrt'},
+        {'n_estimators': 500, 'max_depth': 20, 'min_samples_split': 5, 'min_samples_leaf': 3, 'max_features': 'log2'},
+        {'n_estimators': 300, 'max_depth': 10, 'min_samples_split': 10, 'min_samples_leaf': 5, 'max_features': 0.5},
+    ]
+    
+    best_rf_acc = 0
+    best_rf_params = {}
+    
+    for params in rf_param_grid:
+        accs = []
+        model = RandomForestClassifier(random_state=42, n_jobs=-1, **params)
+        for train_idx, test_idx in tscv.split(X_s):
+            X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
+            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+            model.fit(X_tr, y_tr)
+            accs.append(accuracy_score(y_te, model.predict(X_te)))
+        avg = np.mean(accs)
+        if avg > best_rf_acc:
+            best_rf_acc = avg
+            best_rf_params = params
+            log(f"  RF new best: {avg:.4f}")
+    
+    # --- GridSearch: Gradient Boosting ---
+    log("GridSearch Gradient Boosting...")
+    gb_param_grid = [
+        {'n_estimators': 500, 'max_depth': 5, 'learning_rate': 0.03, 'subsample': 0.8, 'min_samples_split': 10},
+        {'n_estimators': 700, 'max_depth': 6, 'learning_rate': 0.01, 'subsample': 0.8, 'min_samples_split': 10},
+        {'n_estimators': 500, 'max_depth': 4, 'learning_rate': 0.05, 'subsample': 0.7, 'min_samples_split': 15},
+        {'n_estimators': 300, 'max_depth': 7, 'learning_rate': 0.03, 'subsample': 0.9, 'min_samples_split': 5},
+    ]
+    
+    best_gb_acc = 0
+    best_gb_params = {}
+    
+    for params in gb_param_grid:
+        accs = []
+        model = GradientBoostingClassifier(random_state=42, **params)
+        for train_idx, test_idx in tscv.split(X_s):
+            X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
+            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+            model.fit(X_tr, y_tr)
+            accs.append(accuracy_score(y_te, model.predict(X_te)))
+        avg = np.mean(accs)
+        if avg > best_gb_acc:
+            best_gb_acc = avg
+            best_gb_params = params
+            log(f"  GB new best: {avg:.4f}")
+    
+    # --- Train best models on full data ---
+    log("Training best models on full data...")
+    
+    best_xgb = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **best_xgb_params)
+    best_rf = RandomForestClassifier(random_state=42, n_jobs=-1, **best_rf_params)
+    best_gb = GradientBoostingClassifier(random_state=42, **best_gb_params)
+    
+    best_xgb.fit(X_s, y)
+    best_rf.fit(X_s, y)
+    best_gb.fit(X_s, y)
+    
+    # --- Stacking Ensemble ---
+    log("Building Stacking Ensemble...")
+    stacking = StackingClassifier(
         estimators=[
-            ('rf', models['RF']),
-            ('gb', models['GB']),
-            ('xgb', models['XGB']),
+            ('xgb', xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **best_xgb_params)),
+            ('rf', RandomForestClassifier(random_state=42, n_jobs=-1, **best_rf_params)),
+            ('gb', GradientBoostingClassifier(random_state=42, **best_gb_params)),
         ],
-        voting='soft',
-        weights=[1, 1.2, 1.2]  # weight GB & XGB slightly higher
+        final_estimator=LogisticRegression(C=1.0, max_iter=1000),
+        cv=tscv,
+        stack_method='predict_proba',
+        n_jobs=-1
     )
     
-    ens_accs = []
-    for train_idx, test_idx in tscv.split(X):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
+    # Evaluate stacking
+    stack_accs = []
+    for train_idx, test_idx in tscv.split(X_s):
+        X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
         y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-        scaler = StandardScaler()
-        X_tr_s = scaler.fit_transform(X_tr)
-        X_te_s = scaler.transform(X_te)
-        ensemble.fit(X_tr_s, y_tr)
-        preds = ensemble.predict(X_te_s)
-        ens_accs.append(accuracy_score(y_te, preds))
+        stacking.fit(X_tr, y_tr)
+        stack_accs.append(accuracy_score(y_te, stacking.predict(X_te)))
     
-    ens_avg = np.mean(ens_accs)
-    log(f"  Ensemble: {ens_avg:.4f}")
+    stack_avg = np.mean(stack_accs)
+    log(f"  Stacking: {stack_avg:.4f}")
     
-    # Pick best
-    best_name = max(results, key=results.get)
-    best_single = results[best_name]
+    # --- Pick best ---
+    results = {
+        'XGB': (best_xgb_acc, best_xgb),
+        'RF': (best_rf_acc, best_rf),
+        'GB': (best_gb_acc, best_gb),
+        'Stacking': (stack_avg, stacking),
+    }
     
-    if ens_avg > best_single:
-        final_model = ensemble
-        final_name = f"Ensemble({','.join(results.keys())})"
-        final_acc = ens_avg
-        log(f"→ Using Ensemble ({ens_avg:.4f} > {best_name} {best_single:.4f})")
-    else:
-        final_model = models[best_name]
-        final_name = best_name
-        final_acc = best_single
-        log(f"→ Using {best_name} ({best_single:.4f})")
+    best_name = max(results, key=lambda k: results[k][0])
+    best_acc, final_model = results[best_name]
+    
+    log(f"\n🏆 BEST: {best_name} ({best_acc:.4f})")
+    for name, (acc, _) in sorted(results.items(), key=lambda x: -x[1][0]):
+        marker = "🏆" if name == best_name else "  "
+        log(f"  {marker} {name}: {acc:.4f}")
     
     # Final train on ALL data
-    scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
-    final_model.fit(X_s, y)
+    if best_name == 'Stacking':
+        stacking.fit(X_s, y)
+        final_model = stacking
+    # else already fitted above
     
-    return final_model, scaler, features, final_name, final_acc
+    return final_model, scaler, top_features, best_name, best_acc
 
 # ============================================================
 # PREDICT
@@ -417,7 +509,7 @@ F&G: {fng:.0f} {emoji_fng}
 # ============================================================
 def main():
     log("=" * 40)
-    log("CRYPTO ML PIPELINE ULTRA — START")
+    log("CRYPTO ML PIPELINE MAX POWER — START")
     log("=" * 40)
     
     try:
@@ -434,11 +526,13 @@ def main():
     df = add_features(df)
     df = add_target(df)
     
-    log("Training models (this may take a few minutes)...")
+    log("Training models (this may take 3-5 minutes)...")
     try:
         model, scaler, features, model_name, acc = train_model(df)
     except Exception as e:
         log(f"FATAL train: {e}")
+        import traceback
+        traceback.print_exc()
         _send_error(f"⚠️ Training Error\n\n{e}")
         sys.exit(1)
     
