@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 crypto_ml_pipeline.py
-Full pipeline: fetch data → features → train → predict → save model
-Run via GitHub Actions atau Termux
+Full pipeline: fetch data → features → train → predict → save model → Telegram
 """
 
 import pandas as pd
@@ -13,123 +12,70 @@ import pickle
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 import xgboost as xgb
 
-# ============================================================
-# CONFIG
-# ============================================================
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '.')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-# ============================================================
-# LOG
-# ============================================================
 def log(msg):
-    ts = datetime.now().strftime('%H:%M:%S')
-    print(f"[{ts}] {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # ============================================================
-# FETCH DATA
+# FETCH DATA — pakai yfinance (paling reliable)
 # ============================================================
 def fetch_data():
-    log("Fetching BTC data...")
-    df = None
+    log("Fetching BTC data via yfinance...")
+    import yfinance as yf
     
-    # --- Source 1: CoinGecko ---
+    # BTC-USD daily, 2 tahun
+    btc = yf.download('BTC-USD', period='2y', interval='1d', progress=False)
+    if btc.empty:
+        raise RuntimeError("yfinance returned empty data!")
+    
+    df = btc[['Close', 'Volume']].copy()
+    df.columns = ['price', 'volume']
+    df.index = df.index.tz_localize(None) if df.index.tz else df.index
+    df['volume'] = df['volume'].fillna(0)
+    
+    log(f"BTC data: {len(df)} rows, {df.index[0].date()} → {df.index[-1].date()}")
+    
+    # Fear & Greed (optional, fallback 50)
     try:
-        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        params = {'vs_currency': 'usd', 'days': 730, 'interval': 'daily'}
-        resp = requests.get(url, params=params, timeout=30)
-        data = resp.json()
-        if 'prices' in data and len(data['prices']) > 10:
-            df = pd.DataFrame(data['prices'], columns=['ts', 'price'])
-            df['date'] = pd.to_datetime(df['ts'], unit='ms')
-            vol = pd.DataFrame(data['total_volumes'], columns=['ts', 'volume'])
-            df['volume'] = vol['volume'].values
-            df = df.set_index('date').drop('ts', axis=1)
-            df['price'] = df['price'].astype(float)
-            df['volume'] = df['volume'].astype(float)
-            log(f"CoinGecko OK: {len(df)} rows")
-        else:
-            raise ValueError("empty")
-    except Exception as e:
-        log(f"CoinGecko failed: {e}")
-    
-    # --- Source 2: Binance ---
-    if df is None or len(df) == 0:
-        try:
-            url = "https://api.binance.com/api/v3/klines"
-            params = {'symbol': 'BTCUSDT', 'interval': '1d', 'limit': 500}
-            resp = requests.get(url, params=params, timeout=30)
-            raw = resp.json()
-            if isinstance(raw, list) and len(raw) > 10:
-                df = pd.DataFrame(raw, columns=[
-                    'open_time','open','high','low','close','volume',
-                    'close_time','quote_volume','trades','taker_buy_base',
-                    'taker_buy_quote','ignore'
-                ])
-                df['date'] = pd.to_datetime(df['open_time'], unit='ms')
-                df['price'] = df['close'].astype(float)
-                df['volume'] = df['volume'].astype(float)
-                df = df.set_index('date')[['price','volume']]
-                log(f"Binance OK: {len(df)} rows")
-            else:
-                raise ValueError("empty")
-        except Exception as e:
-            log(f"Binance failed: {e}")
-    
-    # --- Source 3: CoinCap (last resort) ---
-    if df is None or len(df) == 0:
-        try:
-            url = "https://api.coincap.io/v2/assets/bitcoin/history?interval=d1"
-            resp = requests.get(url, params={'interval': 'd1'}, timeout=30)
-            raw = resp.json()
-            if 'data' in raw and len(raw['data']) > 10:
-                df = pd.DataFrame(raw['data'])
-                df['date'] = pd.to_datetime(df['time'], unit='ms')
-                df['price'] = df['priceUsd'].astype(float)
-                df['volume'] = 0.0
-                df = df.set_index('date')[['price','volume']]
-                log(f"CoinCap OK: {len(df)} rows")
-            else:
-                raise ValueError("empty")
-        except Exception as e:
-            log(f"CoinCap failed: {e}")
-    
-    if df is None or len(df) == 0:
-        raise RuntimeError("All data sources failed!")
-    
-    # --- F&G Index ---
-    try:
-        fng = requests.get("https://api.alternative.me/fng/?limit=730", timeout=30).json()['data']
+        fng = requests.get("https://api.alternative.me/fng/?limit=730", timeout=10).json()['data']
         fng_df = pd.DataFrame(fng)
-        fng_df['date'] = pd.to_datetime(fng_df['timestamp'], unit='s')
+        fng_df['date'] = pd.to_datetime(fng_df['timestamp'], unit='s').dt.normalize()
         fng_df['fng'] = fng_df['value'].astype(float)
-        fng_df = fng_df.set_index('date').sort_index().resample('D').ffill()
+        fng_df = fng_df.set_index('date').sort_index()
+        fng_df = fng_df[~fng_df.index.duplicated(keep='last')]
+        fng_df = fng_df.resample('D').ffill()
         df = df.join(fng_df[['fng']], how='left')
+        log(f"F&G loaded")
     except:
         df['fng'] = 50
+        log("F&G failed, using 50")
     
-    # --- Macro ---
+    # DXY & S&P500
     try:
-        import yfinance as yf
-        dxy = yf.download('DX-Y.NYB', period='2y', progress=False)
-        if not dxy.empty:
-            df = df.join(dxy['Close'].rename('dxy'), how='left')
-        sp = yf.download('^GSPC', period='2y', progress=False)
-        if not sp.empty:
-            df = df.join(sp['Close'].rename('sp500'), how='left')
+        dxy = yf.download('DX-Y.NYB', period='2y', interval='1d', progress=False)['Close']
+        dxy.index = dxy.index.tz_localize(None) if dxy.index.tz else dxy.index
+        df = df.join(dxy.rename('dxy'), how='left')
+    except:
+        pass
+    try:
+        sp = yf.download('^GSPC', period='2y', interval='1d', progress=False)['Close']
+        sp.index = sp.index.tz_localize(None) if sp.index.tz else sp.index
+        df = df.join(sp.rename('sp500'), how='left')
     except:
         pass
     
     df = df.ffill().bfill()
-    log(f"Final data: {len(df)} rows, {df.index[0].date()} → {df.index[-1].date()}")
+    log(f"Final: {len(df)} rows, {len(df.columns)} columns")
     return df
 
 # ============================================================
@@ -150,15 +96,15 @@ def add_features(df):
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['macd_hist'] = df['macd'] - df['macd_signal']
     
-    def rsi(series, period):
+    def calc_rsi(series, period):
         delta = series.diff()
         gain = delta.where(delta > 0, 0).rolling(period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
         rs = gain / loss.replace(0, np.nan)
         return 100 - (100 / (1 + rs))
     
-    df['rsi_14'] = rsi(df['price'], 14)
-    df['rsi_7'] = rsi(df['price'], 7)
+    df['rsi_14'] = calc_rsi(df['price'], 14)
+    df['rsi_7'] = calc_rsi(df['price'], 7)
     
     df['bb_mid'] = df['price'].rolling(20).mean()
     bb_std = df['price'].rolling(20).std()
@@ -219,11 +165,12 @@ def train_model(df):
     X = df_clean[features]
     y = df_clean['target_dir_7d']
     
-    # Walk-forward
+    log(f"Training: {len(X)} samples, {len(features)} features")
+    
     tscv = TimeSeriesSplit(n_splits=5)
     best_acc = 0
     best_model = None
-    best_scaler = None
+    best_name = ""
     
     models = {
         'RF': RandomForestClassifier(n_estimators=300, max_depth=10, random_state=42, n_jobs=-1),
@@ -237,15 +184,12 @@ def train_model(df):
         for train_idx, test_idx in tscv.split(X):
             X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
             y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            
             scaler = StandardScaler()
             X_tr_s = scaler.fit_transform(X_tr)
             X_te_s = scaler.transform(X_te)
-            
             model.fit(X_tr_s, y_tr)
             preds = model.predict(X_te_s)
             accs.append(accuracy_score(y_te, preds))
-        
         avg = np.mean(accs)
         log(f"  {name}: {avg:.4f}")
         if avg > best_acc:
@@ -253,11 +197,9 @@ def train_model(df):
             best_model = model
             best_name = name
     
-    # Final train on all data
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
     best_model.fit(X_s, y)
-    
     log(f"Best: {best_name} ({best_acc:.4f})")
     return best_model, scaler, features, best_name, best_acc
 
@@ -270,25 +212,22 @@ def predict(model, scaler, features, df):
     for m in missing:
         latest[m] = 0
     latest = latest[features]
-    
     latest_s = scaler.transform(latest)
     pred = model.predict(latest_s)[0]
     proba = model.predict_proba(latest_s)[0]
-    
     btc = df['price'].iloc[-1]
     direction = "NAIK" if pred == 1 else "TURUN"
     conf = max(proba) * 100
-    
     return {
-        'btc_price': btc,
+        'btc_price': float(btc),
         'direction': direction,
-        'confidence': conf,
-        'prob_up': proba[1],
-        'prob_down': proba[0],
-        'rsi': df['rsi_14'].iloc[-1],
-        'fng': df['fng'].iloc[-1],
-        'macd': df['macd_hist'].iloc[-1],
-        'bb_pos': df['bb_position'].iloc[-1]
+        'confidence': float(conf),
+        'prob_up': float(proba[1]),
+        'prob_down': float(proba[0]),
+        'rsi': float(df['rsi_14'].iloc[-1]),
+        'fng': float(df['fng'].iloc[-1]),
+        'macd': float(df['macd_hist'].iloc[-1]),
+        'bb_pos': float(df['bb_position'].iloc[-1])
     }
 
 # ============================================================
@@ -298,7 +237,6 @@ def send_telegram(token, chat_id, result, model_name, acc):
     if not token or not chat_id:
         log("No Telegram config, skip")
         return
-    
     btc = result['btc_price']
     direction = result['direction']
     conf = result['confidence']
@@ -308,7 +246,6 @@ def send_telegram(token, chat_id, result, model_name, acc):
     bb_pos = result['bb_pos']
     prob_up = result['prob_up']
     prob_down = result['prob_down']
-    
     dca = 100000 if btc < 77000 else 50000
     dca_mode = "agresif" if btc < 77000 else "pelan"
     emoji_fng = "😱" if fng < 25 else "😰" if fng < 50 else "😐" if fng < 75 else "🤑"
@@ -348,63 +285,56 @@ def main():
     log("CRYPTO ML PIPELINE START")
     log("=" * 40)
     
-    # 1. Fetch
     try:
         df = fetch_data()
     except Exception as e:
-        log(f"FATAL: Cannot fetch data: {e}")
-        # Send error to Telegram
-        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-            try:
-                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                requests.post(url, json={
-                    'chat_id': TELEGRAM_CHAT_ID,
-                    'text': f"⚠️ <b>Pipeline Error</b>\n\nCannot fetch BTC data.\nError: {e}\n\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')} WIB",
-                    'parse_mode': 'HTML'
-                }, timeout=30)
-            except:
-                pass
+        log(f"FATAL fetch: {e}")
+        _send_error(f"⚠️ <b>Pipeline Error</b>\n\nCannot fetch BTC data.\nError: {e}")
         sys.exit(1)
     
     if len(df) < 100:
-        log(f"FATAL: Not enough data ({len(df)} rows)")
+        log(f"FATAL: not enough data ({len(df)} rows)")
         sys.exit(1)
     
-    # 2. Features
     df = add_features(df)
     df = add_target(df)
     log(f"Features: {len(df.columns)}")
     
-    # 3. Train
     log("Training models...")
-    model, scaler, features, model_name, acc = train_model(df)
+    try:
+        model, scaler, features, model_name, acc = train_model(df)
+    except Exception as e:
+        log(f"FATAL train: {e}")
+        _send_error(f"⚠️ <b>Training Error</b>\n\n{e}")
+        sys.exit(1)
     
-    # 4. Predict
     result = predict(model, scaler, features, df)
     log(f"Prediction: {result['direction']} ({result['confidence']:.1f}%)")
     log(f"BTC: ${result['btc_price']:,.2f}")
     
-    # 5. Save model
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     joblib.dump(model, f'{OUTPUT_DIR}/crypto_model.pkl')
     joblib.dump(scaler, f'{OUTPUT_DIR}/crypto_scaler.pkl')
     with open(f'{OUTPUT_DIR}/feature_cols.pkl', 'wb') as f:
         pickle.dump(features, f)
-    
-    # Save prediction result
     result['model_name'] = model_name
     result['accuracy'] = acc
     result['timestamp'] = datetime.now().isoformat()
     with open(f'{OUTPUT_DIR}/latest_prediction.json', 'w') as f:
-        json.dump(result, f, indent=2, default=str)
-    
+        json.dump(result, f, indent=2)
     log(f"Model saved to {OUTPUT_DIR}/")
     
-    # 6. Telegram
     send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, result, model_name, acc)
-    
     log("DONE!")
     return result
+
+def _send_error(msg):
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=15)
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
