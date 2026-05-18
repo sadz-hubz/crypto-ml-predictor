@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-crypto_ml_pipeline.py — MAXIMUM POWER VERSION
-Feature selection + GridSearchCV + Stacking + Multi-timeframe
+crypto_ml_pipeline.py — MAXIMUM POWER v2
+On-chain + Sentiment + Technical + Macro
+VotingClassifier with walk-forward CV (StackingClassifier bug fixed)
 """
 
 import pandas as pd
@@ -12,12 +13,11 @@ import pickle
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.feature_selection import mutual_info_classif
 import xgboost as xgb
 import warnings
@@ -45,7 +45,7 @@ def fetch_data():
     df.columns = ['price', 'volume']
     df.index = df.index.tz_localize(None) if df.index.tz else df.index
     df['volume'] = df['volume'].fillna(0)
-    log(f"BTC: {len(df)} rows ({df.index[0].date()} → {df.index[-1].date()})")
+    log(f"BTC: {len(df)} rows ({df.index[0].date()} -> {df.index[-1].date()})")
     
     # F&G
     try:
@@ -73,7 +73,100 @@ def fetch_data():
     return df
 
 # ============================================================
-# MAXIMUM FEATURES (200+)
+# ON-CHAIN DATA (via free public APIs)
+# ============================================================
+def fetch_onchain(df):
+    log("Fetching on-chain data...")
+    
+    # 1. Hashrate via Blockchain.com
+    try:
+        r = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=5years&format=json&cors=true", timeout=15)
+        data = r.json()
+        if 'values' in data:
+            hr_df = pd.DataFrame(data['values'])
+            hr_df['date'] = pd.to_datetime(hr_df['x'], unit='s').dt.normalize()
+            hr_df = hr_df.set_index('date').sort_index()
+            hr_df = hr_df[~hr_df.index.duplicated(keep='last')]
+            df = df.join(hr_df[['y']].rename(columns={'y': 'hashrate'}), how='left')
+            log(f"  Hashrate: OK ({len(hr_df)} points)")
+    except Exception as e:
+        log(f"  Hashrate failed: {e}")
+    
+    # 2. Active addresses
+    try:
+        r = requests.get("https://api.blockchain.info/charts/n-unique-addresses?timespan=5years&format=json&cors=true", timeout=15)
+        data = r.json()
+        if 'values' in data:
+            aa_df = pd.DataFrame(data['values'])
+            aa_df['date'] = pd.to_datetime(aa_df['x'], unit='s').dt.normalize()
+            aa_df = aa_df.set_index('date').sort_index()
+            aa_df = aa_df[~aa_df.index.duplicated(keep='last')]
+            df = df.join(aa_df[['y']].rename(columns={'y': 'active_addresses'}), how='left')
+            log(f"  Active addresses: OK")
+    except Exception as e:
+        log(f"  Active addresses failed: {e}")
+    
+    # 3. Transaction count
+    try:
+        r = requests.get("https://api.blockchain.info/charts/n-transactions?timespan=5years&format=json&cors=true", timeout=15)
+        data = r.json()
+        if 'values' in data:
+            tx_df = pd.DataFrame(data['values'])
+            tx_df['date'] = pd.to_datetime(tx_df['x'], unit='s').dt.normalize()
+            tx_df = tx_df.set_index('date').sort_index()
+            tx_df = tx_df[~tx_df.index.duplicated(keep='last')]
+            df = df.join(tx_df[['y']].rename(columns={'y': 'tx_count'}), how='left')
+            log(f"  TX count: OK")
+    except Exception as e:
+        log(f"  TX count failed: {e}")
+    
+    # 4. BTC dominance via CoinGecko
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=15)
+        data = r.json()
+        if 'data' in data:
+            dom = data['data'].get('market_cap_percentage', {}).get('btc', None)
+            if dom:
+                df['btc_dominance'] = float(dom)
+                log(f"  BTC dominance: {dom:.1f}%")
+    except Exception as e:
+        log(f"  BTC dominance failed: {e}")
+    
+    df = df.ffill().bfill()
+    return df
+
+# ============================================================
+# SENTIMENT DATA
+# ============================================================
+def fetch_sentiment(df):
+    log("Fetching sentiment data...")
+    
+    # Social metrics via CoinGecko
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/bitcoin?localization=false&tickers=false&community_data=true&developer_data=true", timeout=15)
+        data = r.json()
+        comm = data.get('community_data', {})
+        dev = data.get('developer_data', {})
+        if comm:
+            df['twitter_followers'] = comm.get('twitter_followers', 0) or 0
+            df['reddit_subscribers'] = comm.get('reddit_subscribers', 0) or 0
+            df['reddit_active'] = comm.get('reddit_accounts_active_48h', 0) or 0
+            df['reddit_posts_48h'] = comm.get('reddit_average_posts_48h', 0) or 0
+            df['reddit_comments_48h'] = comm.get('reddit_average_comments_48h', 0) or 0
+            log(f"  Social metrics: OK")
+        if dev:
+            df['github_stars'] = dev.get('stars', 0) or 0
+            df['github_forks'] = dev.get('forks', 0) or 0
+            df['github_commits_4w'] = dev.get('commit_count_4_weeks', 0) or 0
+            log(f"  Developer metrics: OK")
+    except Exception as e:
+        log(f"  Social/dev metrics failed: {e}")
+    
+    df = df.ffill().bfill()
+    return df
+
+# ============================================================
+# FEATURE ENGINEERING (200+ features)
 # ============================================================
 def add_features(df):
     log("Computing 200+ features...")
@@ -210,7 +303,53 @@ def add_features(df):
         df['fng_extreme_fear'] = (df['fng'] < 20).astype(int)
         df['fng_extreme_greed'] = (df['fng'] > 80).astype(int)
     
-    log(f"Raw features: {len(df.columns)}")
+    # --- On-chain features ---
+    if 'hashrate' in df.columns:
+        for p in [7,14,30,60]:
+            df[f'hashrate_sma_{p}'] = df['hashrate'].rolling(p).mean()
+            df[f'hashrate_change_{p}d'] = df['hashrate'].pct_change(p)
+        df['hashrate_price_ratio'] = df['hashrate'] / df['hashrate'].rolling(30).mean()
+        df['hashrate_price_divergence'] = df['hashrate_price_ratio'] - (df['price'] / df['price'].rolling(30).mean())
+    
+    if 'active_addresses' in df.columns:
+        for p in [7,14,30]:
+            df[f'aa_sma_{p}'] = df['active_addresses'].rolling(p).mean()
+            df[f'aa_change_{p}d'] = df['active_addresses'].pct_change(p)
+        df['nvt_proxy'] = df['price'] / df['active_addresses'].rolling(30).mean()
+        df['nvt_proxy_sma_14'] = df['nvt_proxy'].rolling(14).mean()
+    
+    if 'tx_count' in df.columns:
+        for p in [7,14,30]:
+            df[f'tx_sma_{p}'] = df['tx_count'].rolling(p).mean()
+            df[f'tx_change_{p}d'] = df['tx_count'].pct_change(p)
+        if 'active_addresses' in df.columns:
+            df['tx_per_address'] = df['tx_count'] / df['active_addresses'].replace(0, np.nan)
+    
+    if 'btc_dominance' in df.columns:
+        for p in [7,14,30]:
+            df[f'dom_sma_{p}'] = df['btc_dominance'].rolling(p).mean()
+            df[f'dom_change_{p}d'] = df['btc_dominance'].pct_change(p)
+    
+    # --- Sentiment features ---
+    for col in ['twitter_followers', 'reddit_subscribers', 'reddit_active', 
+                'reddit_posts_48h', 'reddit_comments_48h', 'github_commits_4w']:
+        if col in df.columns:
+            for p in [7,14,30]:
+                df[f'{col}_sma_{p}'] = df[col].rolling(p).mean()
+                df[f'{col}_change_{p}d'] = df[col].pct_change(p)
+    
+    # --- Cross-signal ---
+    if 'fng' in df.columns:
+        df['fng_price_divergence'] = df['fng'].diff(7) - df['price'].pct_change(7) * 100
+    df['volume_price_divergence'] = df['vol_ratio_7'] - df['ret_7d']
+    
+    if 'hashrate' in df.columns and 'fng' in df.columns:
+        df['onchain_sentiment_composite'] = (
+            df['hashrate_change_30d'].fillna(0) * 0.5 +
+            (df['fng'] - 50) / 50 * 0.5
+        )
+    
+    log(f"Total features: {len(df.columns)}")
     return df
 
 # ============================================================
@@ -222,32 +361,21 @@ def add_target(df):
     return df
 
 # ============================================================
-# FEATURE SELECTION — Mutual Information
+# FEATURE SELECTION
 # ============================================================
-def select_features(X, y, n_features=50):
-    log(f"Selecting top {n_features} features via Mutual Information...")
-    
-    # Remove constant features
+def select_features(X, y, n_features=60):
+    log(f"Selecting top {n_features} features via MI...")
     constant_cols = [c for c in X.columns if X[c].nunique() <= 1]
     X = X.drop(columns=constant_cols, errors='ignore')
-    
-    # Fill NaN for MI calculation
     X_filled = X.fillna(0)
-    
-    # Mutual Information
     mi_scores = mutual_info_classif(X_filled, y, random_state=42, n_neighbors=5)
     mi_df = pd.DataFrame({'feature': X.columns, 'mi': mi_scores}).sort_values('mi', ascending=False)
-    
     top_features = mi_df.head(n_features)['feature'].tolist()
-    
-    log(f"Top 10 features:")
-    for _, row in mi_df.head(10).iterrows():
-        log(f"  {row['feature']}: {row['mi']:.4f}")
-    
+    log(f"Top 10: {[(r['feature'], f"{r['mi']:.4f}") for _, r in mi_df.head(10).iterrows()]}")
     return top_features
 
 # ============================================================
-# TRAIN — GridSearchCV + Stacking
+# TRAIN
 # ============================================================
 def train_model(df):
     exclude = ['price', 'volume',
@@ -268,7 +396,6 @@ def train_model(df):
     X_all = df_clean[all_features]
     y = df_clean['target_dir_7d']
     
-    # Feature Selection
     top_features = select_features(X_all, y, n_features=60)
     X = df_clean[top_features]
     
@@ -278,26 +405,9 @@ def train_model(df):
     scaler = StandardScaler()
     X_s = pd.DataFrame(scaler.fit_transform(X), columns=top_features, index=X.index)
     
-    # --- GridSearch: XGBoost ---
+    # XGBoost grid search
     log("GridSearch XGBoost...")
-    xgb_params = {
-        'n_estimators': [300, 500, 700],
-        'max_depth': [4, 6, 8],
-        'learning_rate': [0.01, 0.03, 0.05],
-        'subsample': [0.7, 0.8, 0.9],
-        'colsample_bytree': [0.7, 0.8, 0.9],
-        'reg_alpha': [0, 0.1, 0.5],
-        'reg_lambda': [0.5, 1.0, 2.0],
-    }
-    
-    xgb_model = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0)
-    
-    # Manual grid search with walk-forward (faster than GridSearchCV for time series)
-    best_xgb_acc = 0
-    best_xgb_params = {}
-    
-    # Sample a subset of params to search (full grid too slow)
-    param_grid = [
+    xgb_param_grid = [
         {'n_estimators': 500, 'max_depth': 6, 'learning_rate': 0.03, 'subsample': 0.8, 'colsample_bytree': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 1.0},
         {'n_estimators': 700, 'max_depth': 6, 'learning_rate': 0.01, 'subsample': 0.8, 'colsample_bytree': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 1.0},
         {'n_estimators': 500, 'max_depth': 8, 'learning_rate': 0.03, 'subsample': 0.7, 'colsample_bytree': 0.7, 'reg_alpha': 0.5, 'reg_lambda': 2.0},
@@ -305,84 +415,59 @@ def train_model(df):
         {'n_estimators': 700, 'max_depth': 7, 'learning_rate': 0.02, 'subsample': 0.8, 'colsample_bytree': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 1.0},
     ]
     
-    for params in param_grid:
+    best_xgb_acc, best_xgb_params = 0, {}
+    for params in xgb_param_grid:
         accs = []
         model = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **params)
         for train_idx, test_idx in tscv.split(X_s):
-            X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
-            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            model.fit(X_tr, y_tr)
-            accs.append(accuracy_score(y_te, model.predict(X_te)))
+            model.fit(X_s.iloc[train_idx], y.iloc[train_idx])
+            accs.append(accuracy_score(y.iloc[test_idx], model.predict(X_s.iloc[test_idx])))
         avg = np.mean(accs)
         if avg > best_xgb_acc:
-            best_xgb_acc = avg
-            best_xgb_params = params
-            log(f"  XGB new best: {avg:.4f} | {params}")
+            best_xgb_acc, best_xgb_params = avg, params
+            log(f"  XGB best: {avg:.4f}")
     
-    # --- GridSearch: Random Forest ---
-    log("GridSearch Random Forest...")
+    # RF grid search
+    log("GridSearch RF...")
     rf_param_grid = [
         {'n_estimators': 500, 'max_depth': 15, 'min_samples_split': 10, 'min_samples_leaf': 5, 'max_features': 'sqrt'},
         {'n_estimators': 700, 'max_depth': 12, 'min_samples_split': 15, 'min_samples_leaf': 7, 'max_features': 'sqrt'},
         {'n_estimators': 500, 'max_depth': 20, 'min_samples_split': 5, 'min_samples_leaf': 3, 'max_features': 'log2'},
-        {'n_estimators': 300, 'max_depth': 10, 'min_samples_split': 10, 'min_samples_leaf': 5, 'max_features': 0.5},
     ]
     
-    best_rf_acc = 0
-    best_rf_params = {}
-    
+    best_rf_acc, best_rf_params = 0, {}
     for params in rf_param_grid:
         accs = []
         model = RandomForestClassifier(random_state=42, n_jobs=-1, **params)
         for train_idx, test_idx in tscv.split(X_s):
-            X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
-            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            model.fit(X_tr, y_tr)
-            accs.append(accuracy_score(y_te, model.predict(X_te)))
+            model.fit(X_s.iloc[train_idx], y.iloc[train_idx])
+            accs.append(accuracy_score(y.iloc[test_idx], model.predict(X_s.iloc[test_idx])))
         avg = np.mean(accs)
         if avg > best_rf_acc:
-            best_rf_acc = avg
-            best_rf_params = params
-            log(f"  RF new best: {avg:.4f}")
+            best_rf_acc, best_rf_params = avg, params
+            log(f"  RF best: {avg:.4f}")
     
-    # --- GridSearch: Gradient Boosting ---
-    log("GridSearch Gradient Boosting...")
+    # GB grid search
+    log("GridSearch GB...")
     gb_param_grid = [
         {'n_estimators': 500, 'max_depth': 5, 'learning_rate': 0.03, 'subsample': 0.8, 'min_samples_split': 10},
         {'n_estimators': 700, 'max_depth': 6, 'learning_rate': 0.01, 'subsample': 0.8, 'min_samples_split': 10},
-        {'n_estimators': 500, 'max_depth': 4, 'learning_rate': 0.05, 'subsample': 0.7, 'min_samples_split': 15},
         {'n_estimators': 300, 'max_depth': 7, 'learning_rate': 0.03, 'subsample': 0.9, 'min_samples_split': 5},
     ]
     
-    best_gb_acc = 0
-    best_gb_params = {}
-    
+    best_gb_acc, best_gb_params = 0, {}
     for params in gb_param_grid:
         accs = []
         model = GradientBoostingClassifier(random_state=42, **params)
         for train_idx, test_idx in tscv.split(X_s):
-            X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
-            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-            model.fit(X_tr, y_tr)
-            accs.append(accuracy_score(y_te, model.predict(X_te)))
+            model.fit(X_s.iloc[train_idx], y.iloc[train_idx])
+            accs.append(accuracy_score(y.iloc[test_idx], model.predict(X_s.iloc[test_idx])))
         avg = np.mean(accs)
         if avg > best_gb_acc:
-            best_gb_acc = avg
-            best_gb_params = params
-            log(f"  GB new best: {avg:.4f}")
+            best_gb_acc, best_gb_params = avg, params
+            log(f"  GB best: {avg:.4f}")
     
-    # --- Train best models on full data ---
-    log("Training best models on full data...")
-    
-    best_xgb = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **best_xgb_params)
-    best_rf = RandomForestClassifier(random_state=42, n_jobs=-1, **best_rf_params)
-    best_gb = GradientBoostingClassifier(random_state=42, **best_gb_params)
-    
-    best_xgb.fit(X_s, y)
-    best_rf.fit(X_s, y)
-    best_gb.fit(X_s, y)
-    
-    # --- Voting Ensemble (soft voting) ---
+    # Voting Ensemble
     log("Building Voting Ensemble...")
     voting = VotingClassifier(
         estimators=[
@@ -395,38 +480,30 @@ def train_model(df):
         n_jobs=-1
     )
     
-    # Evaluate voting
     vote_accs = []
     for train_idx, test_idx in tscv.split(X_s):
-        X_tr, X_te = X_s.iloc[train_idx], X_s.iloc[test_idx]
-        y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-        voting.fit(X_tr, y_tr)
-        vote_accs.append(accuracy_score(y_te, voting.predict(X_te)))
-    
+        voting.fit(X_s.iloc[train_idx], y.iloc[train_idx])
+        vote_accs.append(accuracy_score(y.iloc[test_idx], voting.predict(X_s.iloc[test_idx])))
     vote_avg = np.mean(vote_accs)
     log(f"  Voting: {vote_avg:.4f}")
     
-    # --- Pick best ---
     results = {
-        'XGB': (best_xgb_acc, best_xgb),
-        'RF': (best_rf_acc, best_rf),
-        'GB': (best_gb_acc, best_gb),
+        'XGB': (best_xgb_acc, xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0, **best_xgb_params)),
+        'RF': (best_rf_acc, RandomForestClassifier(random_state=42, n_jobs=-1, **best_rf_params)),
+        'GB': (best_gb_acc, GradientBoostingClassifier(random_state=42, **best_gb_params)),
         'Voting': (vote_avg, voting),
     }
     
     best_name = max(results, key=lambda k: results[k][0])
-    best_acc, final_model = results[best_name]
+    best_acc, _ = results[best_name]
     
-    log(f"\n🏆 BEST: {best_name} ({best_acc:.4f})")
+    log(f"BEST: {best_name} ({best_acc:.4f})")
     for name, (acc, _) in sorted(results.items(), key=lambda x: -x[1][0]):
-        marker = "🏆" if name == best_name else "  "
-        log(f"  {marker} {name}: {acc:.4f}")
+        log(f"  {'[BEST]' if name == best_name else '     '} {name}: {acc:.4f}")
     
-    # Final train on ALL data
-    if best_name == 'Voting':
-        voting.fit(X_s, y)
-        final_model = voting
-    # else already fitted above
+    # Final train on all data
+    final_model = results[best_name][1]
+    final_model.fit(X_s, y)
     
     return final_model, scaler, top_features, best_name, best_acc
 
@@ -443,7 +520,7 @@ def predict(model, scaler, features, df):
     pred = model.predict(latest_s)[0]
     proba = model.predict_proba(latest_s)[0]
     btc = df['price'].iloc[-1]
-    direction = "NAIK" if pred == 1 else "TURUN"
+    direction = "UP" if pred == 1 else "DOWN"
     conf = max(proba) * 100
     return {
         'btc_price': float(btc),
@@ -451,10 +528,10 @@ def predict(model, scaler, features, df):
         'confidence': float(conf),
         'prob_up': float(proba[1]),
         'prob_down': float(proba[0]),
-        'rsi': float(df['rsi_14'].iloc[-1]),
-        'fng': float(df['fng'].iloc[-1]),
-        'macd': float(df['macd_12_26_hist'].iloc[-1]),
-        'bb_pos': float(df['bb_20_2.0_pos'].iloc[-1])
+        'rsi': float(df['rsi_14'].iloc[-1]) if 'rsi_14' in df.columns else 0,
+        'fng': float(df['fng'].iloc[-1]) if 'fng' in df.columns else 50,
+        'macd': float(df['macd_12_26_hist'].iloc[-1]) if 'macd_12_26_hist' in df.columns else 0,
+        'bb_pos': float(df['bb_20_2.0_pos'].iloc[-1]) if 'bb_20_2.0_pos' in df.columns else 0.5,
     }
 
 # ============================================================
@@ -475,9 +552,9 @@ def send_telegram(token, chat_id, result, model_name, acc):
     dca = 100000 if btc < 77000 else 50000
     dca_mode = "agresif" if btc < 77000 else "pelan"
     emoji_fng = "😱" if fng < 25 else "😰" if fng < 50 else "😐" if fng < 75 else "🤑"
-    emoji_dir = "🟢" if direction == "NAIK" else "🔴"
+    emoji_dir = "🟢" if direction == "UP" else "🔴"
     
-    msg = f"""📊 <b>BTC DAILY SIGNAL</b>
+    msg = f"""📊 <b>BTC DAILY SIGNAL v2</b>
 
 💰 BTC: <b>${btc:,.2f}</b>
 📈 Prediksi 7d: <b>{emoji_dir} {direction}</b>
@@ -490,9 +567,9 @@ BB%: {bb_pos:.1f}%
 F&G: {fng:.0f} {emoji_fng}
 
 💰 SMART DCA: <b>Rp {dca:,}</b> ({dca_mode})
-📊 NAIK: {prob_up*100:.1f}% | TURUN: {prob_down*100:.1f}%
+📊 UP: {prob_up*100:.1f}% | DOWN: {prob_down*100:.1f}%
 
-🤖 Model: {model_name} ({acc:.1f}% acc)
+🤖 Model: {model_name} ({acc:.1f}% acc) + On-chain + Sentiment
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')} WIB
 ⚠️ Bukan saran finansial. DYOR!"""
     
@@ -508,31 +585,41 @@ F&G: {fng:.0f} {emoji_fng}
 # ============================================================
 def main():
     log("=" * 40)
-    log("CRYPTO ML PIPELINE MAX POWER — START")
+    log("CRYPTO ML PIPELINE v2 — ONCHAIN + SENTIMENT")
     log("=" * 40)
     
     try:
         df = fetch_data()
     except Exception as e:
         log(f"FATAL fetch: {e}")
-        _send_error(f"⚠️ Pipeline Error\n\nFetch failed: {e}")
+        _send_error(f"Pipeline Error: {e}")
         sys.exit(1)
     
     if len(df) < 200:
         log(f"FATAL: not enough data ({len(df)} rows)")
         sys.exit(1)
     
+    try:
+        df = fetch_onchain(df)
+    except Exception as e:
+        log(f"On-chain failed (continuing): {e}")
+    
+    try:
+        df = fetch_sentiment(df)
+    except Exception as e:
+        log(f"Sentiment failed (continuing): {e}")
+    
     df = add_features(df)
     df = add_target(df)
     
-    log("Training models (this may take 3-5 minutes)...")
+    log("Training models (3-5 min)...")
     try:
         model, scaler, features, model_name, acc = train_model(df)
     except Exception as e:
         log(f"FATAL train: {e}")
         import traceback
         traceback.print_exc()
-        _send_error(f"⚠️ Training Error\n\n{e}")
+        _send_error(f"Training Error: {e}")
         sys.exit(1)
     
     result = predict(model, scaler, features, df)
@@ -541,13 +628,14 @@ def main():
     log(f"Model: {model_name} ({acc:.1f}% acc)")
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    joblib.dump(model, f'{OUTPUT_DIR}/crypto_model.pkl')
-    joblib.dump(scaler, f'{OUTPUT_DIR}/crypto_scaler.pkl')
-    with open(f'{OUTPUT_DIR}/feature_cols.pkl', 'wb') as f:
+    joblib.dump(model, f'{OUTPUT_DIR}/crypto_model_v2.pkl')
+    joblib.dump(scaler, f'{OUTPUT_DIR}/crypto_scaler_v2.pkl')
+    with open(f'{OUTPUT_DIR}/feature_cols_v2.pkl', 'wb') as f:
         pickle.dump(features, f)
     result['model_name'] = model_name
     result['accuracy'] = acc
     result['timestamp'] = datetime.now().isoformat()
+    result['version'] = 'v2_onchain_sentiment'
     with open(f'{OUTPUT_DIR}/latest_prediction.json', 'w') as f:
         json.dump(result, f, indent=2)
     log(f"Model saved to {OUTPUT_DIR}/")
